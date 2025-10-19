@@ -393,6 +393,25 @@ def patchUnicornJS():
             "// typedef Int128 __int128_t; // Disabled for Emscripten compatibility",
         })
     
+    # Fix mprotect for Emscripten
+    osdep_path = os.path.join(UNICORN_QEMU_DIR, "util/osdep.c")
+    if os.path.exists(osdep_path):
+        prepend(osdep_path, 
+            '#ifdef __EMSCRIPTEN__\n'
+            '// Stub mprotect for Emscripten\n'
+            '#define PROT_NONE 0\n'
+            '#define PROT_READ 1\n'
+            '#define PROT_WRITE 2\n'
+            '#define PROT_EXEC 4\n'
+            'static inline int mprotect(void *addr, size_t len, int prot) {\n'
+            '    // Emscripten doesn\'t support mprotect, just return success\n'
+            '    return 0;\n'
+            '}\n'
+            '#else\n'
+            '#include <sys/mman.h>\n'
+            '#endif\n\n'
+        )
+    
     # Fix Glib function pointer issues
     glib_compat_path = os.path.join(UNICORN_DIR, "glib_compat/glib_compat.c")
     if os.path.exists(glib_compat_path):
