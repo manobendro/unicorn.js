@@ -342,74 +342,119 @@ uint64_t glue(adapter_helper_, name)(GEN_ADAPTER_ARGS) { \\
 def patchUnicornTCI():
     """
     Patches Unicorn's QEMU fork to add the TCG Interpreter backend
+    Note: Unicorn 2.x already has TCI built-in, so we only need minimal patching
     """
-    # Enable TCI
-    replace(os.path.join(UNICORN_QEMU_DIR, "configure"), {
-        "strip_opt=\"yes\"": "strip_opt=\"yes\"\ntcg_interpreter=\"yes\"",
-        "# XXX: suppress that": "if test \"$tcg_interpreter\" = \"yes\" ; then\n  echo \"CONFIG_TCG_INTERPRETER=y\" >> $config_host_mak\nfi\n# XXX: suppress that",
-        "if test \"$ARCH\" = \"sparc64\" ; then": "if test \"$tcg_interpreter\" = \"yes\"; then\n  QEMU_INCLUDES=\"-I\$(SRC_PATH)/tcg/tci $QEMU_INCLUDES\"\nelif test \"$ARCH\" = \"sparc64\" ; then"
-    })
-    # Add executable permissions for the new configure file
-    path = os.path.join(UNICORN_QEMU_DIR, "configure")
-    st = os.stat(path)
-    os.chmod(path, st.st_mode | stat.S_IEXEC)
-    # Copy missing TCI source files and patch them with Unicorn updates
-    copytree(ORIGINAL_QEMU_DIR, UNICORN_QEMU_DIR)
-    replace(os.path.join(UNICORN_QEMU_DIR, "tcg/tci/tcg-target.c"), {
-        "tcg_target_available_regs": "s->tcg_target_available_regs",
-        "tcg_target_call_clobber_regs": "s->tcg_target_call_clobber_regs",
-        "tcg_add_target_add_op_defs(": "tcg_add_target_add_op_defs(s, ",
-    })
-    replace(os.path.join(UNICORN_QEMU_DIR, "tcg/tci/tcg-target.h"), {
-        "#define tcg_qemu_tb_exec": "//#define tcg_qemu_tb_exec",
-    })
-    # Add TCI to Makefile.targets
-    insert(os.path.join(UNICORN_QEMU_DIR, "Makefile.target"),
-        "obj-y += tcg/tcg.o tcg/optimize.o", [
-            "obj-$(CONFIG_TCG_INTERPRETER) += tci.o"
-        ]
-    )
-    # Add TCI symbols
-    insert(os.path.join(UNICORN_QEMU_DIR, "header_gen.py"),
-        "symbols = (", [
-            "    'tci_tb_ptr',",
-            "    'tcg_qemu_tb_exec',",
-        ]
-    )
-    # Update platform headers with new symbols
-    cmd = "bash -c \"cd " + UNICORN_QEMU_DIR + " && ./gen_all_header.sh\""
-    os.system(cmd)
+    # Enable TCI in configure if not already enabled
+    configure_path = os.path.join(UNICORN_QEMU_DIR, "configure")
+    if os.path.exists(configure_path):
+        with open(configure_path, 'r') as f:
+            configure_content = f.read()
+        if "tcg_interpreter=\"yes\"" not in configure_content:
+            replace(configure_path, {
+                "strip_opt=\"yes\"": "strip_opt=\"yes\"\ntcg_interpreter=\"yes\"",
+            })
+        # Add executable permissions for the configure file
+        st = os.stat(configure_path)
+        os.chmod(configure_path, st.st_mode | stat.S_IEXEC)
 
 
 def patchUnicornJS():
     """
     Patches Unicorn files to target JavaScript
     """
-    # Disable unnecessary options
-    replace(os.path.join(UNICORN_DIR, "config.mk"), {
-        "UNICORN_DEBUG ?= yes": "UNICORN_DEBUG ?= no",
-        "UNICORN_SHARED ?= yes": "UNICORN_SHARED ?= no",
-    })
-    # Ensure QEMU's object files have different base names
-    name = "rename_objects.py"
-    with open(os.path.join(UNICORN_DIR, name), "wt") as f:
-        f.write("")
-    replace(os.path.join(UNICORN_DIR, "Makefile"), {
-        "$(MAKE) -C qemu $(SMP_MFLAGS)":
-        "$(MAKE) -C qemu $(SMP_MFLAGS)\r\n\t@python " + name,
-        '	./configure --cc="${CC}" --extra-cflags="$(UNICORN_CFLAGS)" --target-list="$(UNICORN_TARGETS)" ${UNICORN_QEMU_FLAGS}':
-        '	./configure --cc="${CC}" --extra-cflags="$(UNICORN_CFLAGS)" --target-list="$(UNICORN_TARGETS)" ${UNICORN_QEMU_FLAGS} --disable-stack-protector --cpu=i386',
-    })
-    # Replace sigsetjmp/siglongjump with setjmp/longjmp
-    replace(os.path.join(UNICORN_QEMU_DIR, "cpu-exec.c"), {
-        "sigsetjmp(cpu->jmp_env, 0)": "setjmp(cpu->jmp_env)",
-        "siglongjmp(cpu->jmp_env, 1)": "longjmp(cpu->jmp_env, 1)",
-    })
+    # Note: Unicorn 2.x uses CMake, so we need to patch CMakeLists.txt to support emcc
+    cmake_path = os.path.join(UNICORN_DIR, "CMakeLists.txt")
+    if os.path.exists(cmake_path):
+        # Add emcc compiler detection before the "Unknown host compiler" error
+        replace(cmake_path, {
+            '            message(FATAL_ERROR "Unknown host compiler: ${CMAKE_C_COMPILER}.")':
+            '            # Check for Emscripten compiler\n'
+            '            string(FIND "${CMAKE_C_COMPILER}" "emcc" UC_RET)\n'
+            '            if(${UC_RET} GREATER_EQUAL "0")\n'
+            '                set(UNICORN_TARGET_ARCH "i386")\n'
+            '                break()\n'
+            '            endif()\n'
+            '            message(FATAL_ERROR "Unknown host compiler: ${CMAKE_C_COMPILER}.")',
+        })
+    
+    # Replace sigsetjmp/siglongjump with setjmp/longjmp in accel/tcg/cpu-exec.c
+    cpu_exec_path = os.path.join(UNICORN_QEMU_DIR, "accel/tcg/cpu-exec.c")
+    if os.path.exists(cpu_exec_path):
+        replace(cpu_exec_path, {
+            "sigsetjmp(cpu->jmp_env, 0)": "setjmp(cpu->jmp_env)",
+            "siglongjmp(cpu->jmp_env, 1)": "longjmp(cpu->jmp_env, 1)",
+        })
+    
+    # Fix int128 typedef conflict with Emscripten
+    int128_path = os.path.join(UNICORN_QEMU_DIR, "include/qemu/int128.h")
+    if os.path.exists(int128_path):
+        replace(int128_path, {
+            "typedef Int128 __int128_t;":
+            "// typedef Int128 __int128_t; // Disabled for Emscripten compatibility",
+        })
+    
+    # Fix mprotect and mmap for Emscripten
+    osdep_path = os.path.join(UNICORN_QEMU_DIR, "util/osdep.c")
+    if os.path.exists(osdep_path):
+        prepend(osdep_path, 
+            '#ifdef __EMSCRIPTEN__\n'
+            '// Stub mprotect for Emscripten\n'
+            '#include <stddef.h>\n'
+            '#define PROT_NONE 0\n'
+            '#define PROT_READ 1\n'
+            '#define PROT_WRITE 2\n'
+            '#define PROT_EXEC 4\n'
+            'static inline int mprotect(void *addr, size_t len, int prot) {\n'
+            '    // Emscripten doesn\'t support mprotect, just return success\n'
+            '    return 0;\n'
+            '}\n'
+            '#else\n'
+            '#include <sys/mman.h>\n'
+            '#endif\n\n'
+        )
+    
+    # Fix oslib-posix.c for Emscripten
+    oslib_posix_path = os.path.join(UNICORN_QEMU_DIR, "util/oslib-posix.c")
+    if os.path.exists(oslib_posix_path):
+        prepend(oslib_posix_path,
+            '#ifdef __EMSCRIPTEN__\n'
+            '// Stub mmap functions for Emscripten\n'
+            '#include <stddef.h>\n'
+            '#include <stdlib.h>\n'
+            '#include <sys/types.h>\n'
+            '#define MAP_FAILED ((void *) -1)\n'
+            '#define MAP_PRIVATE 0x02\n'
+            '#define MAP_ANONYMOUS 0x20\n'
+            '#define MAP_ANON MAP_ANONYMOUS\n'
+            '#define MAP_SHARED 0x01\n'
+            '#define MAP_FIXED 0x10\n'
+            '#define PROT_NONE 0\n'
+            '#define PROT_READ 1\n'
+            '#define PROT_WRITE 2\n'
+            '#define PROT_EXEC 4\n'
+            'static inline void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {\n'
+            '    // Emscripten doesn\'t support mmap, use malloc as fallback\n'
+            '    if (addr && (flags & MAP_FIXED)) {\n'
+            '        // If fixed address requested, we can\'t honor it, return failure\n'
+            '        return MAP_FAILED;\n'
+            '    }\n'
+            '    void *ptr = malloc(length);\ n'
+            '    return ptr ? ptr : MAP_FAILED;\n'
+            '}\n'
+            'static inline int munmap(void *addr, size_t length) {\n'
+            '    free(addr);\n'
+            '    return 0;\n'
+            '}\n'
+            '#endif\n\n'
+        )
+    
     # Fix Glib function pointer issues
-    replace(os.path.join(UNICORN_QEMU_DIR, "glib_compat.c"), {
-        "(GCompareDataFunc) compare_func) (l1->data, l2->data, user_data)":
-            "(GCompareFunc) compare_func) (l1->data, l2->data)",
-    })
+    glib_compat_path = os.path.join(UNICORN_DIR, "glib_compat/glib_compat.c")
+    if os.path.exists(glib_compat_path):
+        replace(glib_compat_path, {
+            "(GCompareDataFunc) compare_func) (l1->data, l2->data, user_data)":
+                "(GCompareFunc) compare_func) (l1->data, l2->data)",
+        })
     # Fix QEMU function pointer issues
     replace(os.path.join(UNICORN_QEMU_DIR, "include/exec/helper-proto.h"), {
         # Adapter helpers
@@ -456,52 +501,59 @@ def patchUnicornJS():
          #define DEF_HELPER_FLAGS_3(name, flags, ret, t1, t2, t3)                \\
          GEN_ADAPTER_3(name, ret, t1, t2, t3) \\""",
         "#define DEF_HELPER_FLAGS_4(name, flags, ret, t1, t2, t3, t4)            \\":"""
-         #define DEF_HELPER_FLAGS_4(name, flags, ret, t1, t2, t3, t4)            \\
+         #define DEF_HELPER_FLAGS_4(name, flags, ret, t1, t2, t3, t4) \\
          GEN_ADAPTER_4(name, ret, t1, t2, t3, t4) \\""",
         "#define DEF_HELPER_FLAGS_5(name, flags, ret, t1, t2, t3, t4, t5)        \\":"""
          #define DEF_HELPER_FLAGS_5(name, flags, ret, t1, t2, t3, t4, t5)        \\
          GEN_ADAPTER_5(name, ret, t1, t2, t3, t4, t5) \\""",
     })
-    replace(os.path.join(UNICORN_QEMU_DIR, "tcg-runtime.c"), {
-        # Adapter helpers
-        '#include "exec/helper-head.h"':
-        '#include "exec/helper-head.h"\n' +
-        PATCH_HELPER_ADAPTER_GEN,
-        # Add uc_tracecode to globals
-        '#include "tcg-runtime.h"':"""
-        #undef DEF_HELPER_FLAGS_2
-        #define DEF_HELPER_FLAGS_2(name, flags, ret, t1, t2) \\
-            dh_ctype(ret) HELPER(name) (dh_ctype(t1), dh_ctype(t2)); \\
-            uint64_t glue(adapter_helper_, name)(GEN_ADAPTER_ARGS); \\
-            GEN_ADAPTER_2_DEFINE(name, ret, t1, t2)
-        #define DEF_HELPER_FLAGS_4(name, flags, ret, t1, t2, t3, t4) \\
-            dh_ctype(ret) HELPER(name) (dh_ctype(t1), dh_ctype(t2), dh_ctype(t3), dh_ctype(t4)); \\
-            uint64_t glue(adapter_helper_, name)(GEN_ADAPTER_ARGS); \\
-            GEN_ADAPTER_4_DEFINE(name, ret, t1, t2, t3, t4)
-        DEF_HELPER_4(uc_tracecode, void, i32, i32, ptr, i64)
-        #include "tcg-runtime.h"
-        """,
-    })
+    # tcg-runtime.c is now in accel/tcg/ directory in Unicorn 2.x
+    tcg_runtime_path = os.path.join(UNICORN_QEMU_DIR, "accel/tcg/tcg-runtime.c")
+    if os.path.exists(tcg_runtime_path):
+        replace(tcg_runtime_path, {
+            # Adapter helpers
+            '#include "exec/helper-head.h"':
+            '#include "exec/helper-head.h"\n' +
+            PATCH_HELPER_ADAPTER_GEN,
+            # Add uc_tracecode to globals
+            '#include "tcg-runtime.h"':"""
+            #undef DEF_HELPER_FLAGS_2
+            #define DEF_HELPER_FLAGS_2(name, flags, ret, t1, t2) \\
+                dh_ctype(ret) HELPER(name) (dh_ctype(t1), dh_ctype(t2)); \\
+                uint64_t glue(adapter_helper_, name)(GEN_ADAPTER_ARGS); \\
+                GEN_ADAPTER_2_DEFINE(name, ret, t1, t2)
+            #define DEF_HELPER_FLAGS_4(name, flags, ret, t1, t2, t3, t4) \\
+                dh_ctype(ret) HELPER(name) (dh_ctype(t1), dh_ctype(t2), dh_ctype(t3), dh_ctype(t4)); \\
+                uint64_t glue(adapter_helper_, name)(GEN_ADAPTER_ARGS); \\
+                GEN_ADAPTER_4_DEFINE(name, ret, t1, t2, t3, t4)
+            DEF_HELPER_4(uc_tracecode, void, i32, i32, ptr, i64)
+            #include "tcg-runtime.h"
+            """,
+        })
     replace(os.path.join(UNICORN_QEMU_DIR, "include/exec/helper-tcg.h"), {
         "HELPER(NAME)":
         "glue(adapter_helper_, NAME)"
     })
-    # Add arch-suffixes to adapters
-    header_gen_patched = False
-    with open(os.path.join(UNICORN_QEMU_DIR, "header_gen.py"), 'r') as f:
-        if 'adapter_' in f.read():
-            header_gen_patched = True
-    if header_gen_patched == False:
-        os.remove(os.path.join(UNICORN_QEMU_DIR, "header_gen.py.bak"))
-        replace(os.path.join(UNICORN_QEMU_DIR, "header_gen.py"), {
-            '      print("#define %s %s_%s" %(s, s, arch))':
-            '      print("#define %s %s_%s" %(s, s, arch))\n'
-            '      if s.startswith("helper_"):\n'
-            '          s = "adapter_" + s\n'
-            '          print("#define %s %s_%s" %(s, s, arch))',
-        })
-    # Define adapters
-    translate_pat = os.path.join(UNICORN_QEMU_DIR, "target-*/translate.c")
+    # Add arch-suffixes to adapters (if header_gen.py exists)
+    header_gen_path = os.path.join(UNICORN_QEMU_DIR, "header_gen.py")
+    if os.path.exists(header_gen_path):
+        header_gen_patched = False
+        with open(header_gen_path, 'r') as f:
+            if 'adapter_' in f.read():
+                header_gen_patched = True
+        if header_gen_patched == False:
+            bak_path = header_gen_path + ".bak"
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+            replace(header_gen_path, {
+                '      print("#define %s %s_%s" %(s, s, arch))':
+                '      print("#define %s %s_%s" %(s, s, arch))\n'
+                '      if s.startswith("helper_"):\n'
+                '          s = "adapter_" + s\n'
+                '          print("#define %s %s_%s" %(s, s, arch))',
+            })
+    # Define adapters in translate.c files (now in target/*/ directories)
+    translate_pat = os.path.join(UNICORN_QEMU_DIR, "target/*/translate.c")
     for fpath in glob.glob(translate_pat):
         prepend(fpath, '#define GEN_ADAPTER_DEFINE\n')
     # Fix register allocation for arguments
@@ -524,36 +576,19 @@ def patchUnicornJS():
         """
     })
     # Fix unaligned reads
-    append(os.path.join(UNICORN_QEMU_DIR, "include/qemu-common.h"),
-        PATCH_UNALIGNED_MEMACCESS)
-    replace(os.path.join(UNICORN_QEMU_DIR, "include/exec/exec-all.h"), {
-        "    *(uint32_t *)jmp_addr = addr - (jmp_addr + 4);":
-        "    UNALIGNED_WRITE32_LE(jmp_addr, addr - (jmp_addr + 4));"
-    })
-    replace(os.path.join(UNICORN_QEMU_DIR, "tci.c"), {
-        "*(tcg_target_ulong *)(*tb_ptr)":
-        "UNALIGNED_READ32_LE(*tb_ptr)",
-        "*(uint32_t *)(*tb_ptr)":
-        "UNALIGNED_READ32_LE(*tb_ptr)",
-        "*(int32_t *)(*tb_ptr)":
-        "UNALIGNED_READ32_LE(*tb_ptr)",
-        "*(uint64_t *)tb_ptr":
-        "UNALIGNED_READ64_LE(tb_ptr)",
-        # Stores
-        "*(uint16_t *)(t1 + t2) = t0":
-        "UNALIGNED_WRITE16_LE(t1 + t2, t0)",
-        "*(uint32_t *)(t1 + t2) = t0":
-        "UNALIGNED_WRITE32_LE(t1 + t2, t0)",
-        "*(uint64_t *)(t1 + t2) = t0":
-        "UNALIGNED_WRITE64_LE(t1 + t2, t0)",
-        # Loads
-        "*(uint32_t *)(t1 + t2)":
-        "UNALIGNED_READ32_LE(t1 + t2)",
-        "*(uint64_t *)(t1 + t2)":
-        "UNALIGNED_READ64_LE(t1 + t2)",
-        "*(int32_t *)(t1 + t2)":
-        "(int32_t)UNALIGNED_READ32_LE(t1 + t2)",
-    })
+    qemu_common_h = os.path.join(UNICORN_QEMU_DIR, "include/qemu-common.h")
+    if os.path.exists(qemu_common_h):
+        append(qemu_common_h, PATCH_UNALIGNED_MEMACCESS)
+    
+    exec_all_h = os.path.join(UNICORN_QEMU_DIR, "include/exec/exec-all.h")
+    if os.path.exists(exec_all_h):
+        replace(exec_all_h, {
+            "    *(uint32_t *)jmp_addr = addr - (jmp_addr + 4);":
+            "    UNALIGNED_WRITE32_LE(jmp_addr, addr - (jmp_addr + 4));"
+        })
+    
+    # Note: tci.c doesn't exist in Unicorn 2.x, TCI has been removed or integrated differently
+    # Skip TCI patches for Unicorn 2.x
     # Fix unsupported varargs in uc_hook_add function signature
     replace(os.path.join(UNICORN_DIR, "include/unicorn/unicorn.h"), {
         "        void *user_data, uint64_t begin, uint64_t end, ...);":
@@ -584,17 +619,57 @@ def compileUnicorn(targets):
     patchUnicornTCI()
     patchUnicornJS()
 
-    # Emscripten: Make
+    # Build with CMake and Emscripten
     os.chdir('unicorn')
-    os.system('make clean')
+    
+    # Clean previous build
+    if os.path.exists('build'):
+        import shutil
+        shutil.rmtree('build')
+    
+    # Create build directory
+    os.makedirs('build', exist_ok=True)
+    os.chdir('build')
+    
     if os.name == 'posix':
-        cmd = ''
+        # Configure CMake with emscripten
+        print("Configuring with CMake and Emscripten...")
+        cmake_cmd = 'emcmake cmake ..'
+        cmake_cmd += ' -DCMAKE_BUILD_TYPE=Release'
+        cmake_cmd += ' -DBUILD_SHARED_LIBS=OFF'
+        
+        # Set architecture targets if specified
         if targets:
-            cmd += 'UNICORN_ARCHS="%s" ' % (' '.join(targets))
-        cmd += 'emmake make unicorn'
-        os.system(cmd)
-    os.chdir('..')
+            archs_upper = [t.upper() for t in targets]
+            cmake_cmd += ' -DUNICORN_ARCH="%s"' % (';'.join(archs_upper))
+        
+        ret = os.system(cmake_cmd)
+        if ret != 0:
+            print("CMake configuration failed!")
+            os.chdir('../..')
+            return
+        
+        # Build using emmake
+        print("Building Unicorn with Emscripten...")
+        ret = os.system('emmake make -j$(nproc)')
+        if ret != 0:
+            print("Build failed!")
+            os.chdir('../..')
+            return
+        
+        # Copy the built library to the expected location
+        if os.path.exists('libunicorn.a'):
+            import shutil
+            shutil.copy('libunicorn.a', '../libunicorn.a')
+    
+    os.chdir('../..')
 
+    # Check if library was built successfully
+    if not os.path.exists('unicorn/libunicorn.a'):
+        print("Error: libunicorn.a was not built successfully")
+        return
+
+    print("Compiling to JavaScript...")
     # Compile static library to JavaScript
     methods = ['ccall', 'getValue', 'setValue', 'addFunction', 'removeFunction', 'writeArrayToMemory']
     cmd = 'emcc'
@@ -614,7 +689,11 @@ def compileUnicorn(targets):
         cmd += ' -o src/libunicorn-%s.out.js' % ('-'.join(targets))
     else:
         cmd += ' -o src/libunicorn.out.js'
-    os.system(cmd)
+    ret = os.system(cmd)
+    if ret == 0:
+        print("Build completed successfully!")
+    else:
+        print("JavaScript compilation failed!")
 
 
 def exit_usage():
