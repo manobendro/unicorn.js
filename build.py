@@ -362,7 +362,20 @@ def patchUnicornJS():
     """
     Patches Unicorn files to target JavaScript
     """
-    # Note: Unicorn 2.x uses CMake, so we skip config.mk and Makefile patches
+    # Note: Unicorn 2.x uses CMake, so we need to patch CMakeLists.txt to support emcc
+    cmake_path = os.path.join(UNICORN_DIR, "CMakeLists.txt")
+    if os.path.exists(cmake_path):
+        # Add emcc compiler detection before the "Unknown host compiler" error
+        replace(cmake_path, {
+            '            message(FATAL_ERROR "Unknown host compiler: ${CMAKE_C_COMPILER}.")':
+            '            # Check for Emscripten compiler\n'
+            '            string(FIND "${CMAKE_C_COMPILER}" "emcc" UC_RET)\n'
+            '            if(${UC_RET} GREATER_EQUAL "0")\n'
+            '                set(UNICORN_TARGET_ARCH "i386")\n'
+            '                break()\n'
+            '            endif()\n'
+            '            message(FATAL_ERROR "Unknown host compiler: ${CMAKE_C_COMPILER}.")',
+        })
     
     # Replace sigsetjmp/siglongjump with setjmp/longjmp in accel/tcg/cpu-exec.c
     cpu_exec_path = os.path.join(UNICORN_QEMU_DIR, "accel/tcg/cpu-exec.c")
@@ -371,6 +384,15 @@ def patchUnicornJS():
             "sigsetjmp(cpu->jmp_env, 0)": "setjmp(cpu->jmp_env)",
             "siglongjmp(cpu->jmp_env, 1)": "longjmp(cpu->jmp_env, 1)",
         })
+    
+    # Fix int128 typedef conflict with Emscripten
+    int128_path = os.path.join(UNICORN_QEMU_DIR, "include/qemu/int128.h")
+    if os.path.exists(int128_path):
+        replace(int128_path, {
+            "typedef Int128 __int128_t;":
+            "// typedef Int128 __int128_t; // Disabled for Emscripten compatibility",
+        })
+    
     # Fix Glib function pointer issues
     glib_compat_path = os.path.join(UNICORN_DIR, "glib_compat/glib_compat.c")
     if os.path.exists(glib_compat_path):
@@ -559,76 +581,50 @@ def compileUnicorn(targets):
     patchUnicornTCI()
     patchUnicornJS()
 
-    # For Unicorn 2.x with Emscripten, we need to use a manual build approach
-    # since CMake doesn't support emcc compiler detection
+    # Build with CMake and Emscripten
     os.chdir('unicorn')
     
+    # Clean previous build
+    if os.path.exists('build'):
+        import shutil
+        shutil.rmtree('build')
+    
+    # Create build directory
+    os.makedirs('build', exist_ok=True)
+    os.chdir('build')
+    
     if os.name == 'posix':
-        # Configure QEMU with Emscripten
-        print("Configuring QEMU with Emscripten...")
-        os.chdir('qemu')
+        # Configure CMake with emscripten
+        print("Configuring with CMake and Emscripten...")
+        cmake_cmd = 'emcmake cmake ..'
+        cmake_cmd += ' -DCMAKE_BUILD_TYPE=Release'
+        cmake_cmd += ' -DBUILD_SHARED_LIBS=OFF'
         
-        # Set up target list
+        # Set architecture targets if specified
         if targets:
-            target_list = ','.join([t + '-softmmu' for t in targets])
-        else:
-            # Default to all supported architectures
-            target_list = 'aarch64-softmmu,arm-softmmu,m68k-softmmu,mips-softmmu,mipsel-softmmu,mips64-softmmu,mips64el-softmmu,ppc-softmmu,ppc64-softmmu,riscv32-softmmu,riscv64-softmmu,s390x-softmmu,sparc-softmmu,sparc64-softmmu,tricore-softmmu,i386-softmmu,x86_64-softmmu'
+            archs_upper = [t.upper() for t in targets]
+            cmake_cmd += ' -DUNICORN_ARCH="%s"' % (';'.join(archs_upper))
         
-        configure_cmd = 'emconfigure ./configure'
-        configure_cmd += ' --target-list=' + target_list
-        configure_cmd += ' --disable-stack-protector'
-        configure_cmd += ' --extra-cflags="-DUNICORN_HAS_X86 -DUNICORN_HAS_ARM -DUNICORN_HAS_M68K -DUNICORN_HAS_MIPS -DUNICORN_HAS_PPC -DUNICORN_HAS_RISCV -DUNICORN_HAS_S390X -DUNICORN_HAS_SPARC -DUNICORN_HAS_TRICORE"'
-        
-        ret = os.system(configure_cmd)
+        ret = os.system(cmake_cmd)
         if ret != 0:
-            print("QEMU configuration failed!")
+            print("CMake configuration failed!")
             os.chdir('../..')
             return
         
-        # Build QEMU
-        print("Building QEMU...")
+        # Build using emmake
+        print("Building Unicorn with Emscripten...")
         ret = os.system('emmake make -j$(nproc)')
         if ret != 0:
-            print("QEMU build failed!")
+            print("Build failed!")
             os.chdir('../..')
             return
         
-        os.chdir('..')
-        
-        # Now build Unicorn itself
-        print("Building Unicorn library...")
-        
-        # Collect all object files
-        import glob
-        obj_files = []
-        for root, dirs, files in os.walk('qemu'):
-            for f in files:
-                if f.endswith('.o'):
-                    obj_files.append(os.path.join(root, f))
-        
-        # Add unicorn core files
-        unicorn_sources = ['uc.c', 'list.c']
-        for src in glob.glob('glib_compat/*.c'):
-            unicorn_sources.append(src)
-        
-        # Compile unicorn sources
-        for src in unicorn_sources:
-            obj = src.replace('.c', '.o')
-            compile_cmd = 'emcc -c -Os '
-            compile_cmd += '-DUNICORN_HAS_X86 -DUNICORN_HAS_ARM -DUNICORN_HAS_M68K -DUNICORN_HAS_MIPS '
-            compile_cmd += '-DUNICORN_HAS_PPC -DUNICORN_HAS_RISCV -DUNICORN_HAS_S390X -DUNICORN_HAS_SPARC -DUNICORN_HAS_TRICORE '
-            compile_cmd += '-Iinclude -Iqemu/include -Iqemu -Iglib_compat '
-            compile_cmd += src + ' -o ' + obj
-            os.system(compile_cmd)
-            obj_files.append(obj)
-        
-        # Create static library
-        print("Creating static library...")
-        ar_cmd = 'emar rcs libunicorn.a ' + ' '.join(obj_files)
-        os.system(ar_cmd)
+        # Copy the built library to the expected location
+        if os.path.exists('libunicorn.a'):
+            import shutil
+            shutil.copy('libunicorn.a', '../libunicorn.a')
     
-    os.chdir('..')
+    os.chdir('../..')
 
     # Check if library was built successfully
     if not os.path.exists('unicorn/libunicorn.a'):
