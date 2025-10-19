@@ -3,3 +3,11 @@ node_modules/
 
 # Emscripten builds
 *.out.js
+*.out.wasm
+
+# Build directories
+unicorn/build/
+unicorn/libunicorn.a
+
+# Backup files
+*.bak

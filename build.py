@@ -393,12 +393,13 @@ def patchUnicornJS():
             "// typedef Int128 __int128_t; // Disabled for Emscripten compatibility",
         })
     
-    # Fix mprotect for Emscripten
+    # Fix mprotect and mmap for Emscripten
     osdep_path = os.path.join(UNICORN_QEMU_DIR, "util/osdep.c")
     if os.path.exists(osdep_path):
         prepend(osdep_path, 
             '#ifdef __EMSCRIPTEN__\n'
             '// Stub mprotect for Emscripten\n'
+            '#include <stddef.h>\n'
             '#define PROT_NONE 0\n'
             '#define PROT_READ 1\n'
             '#define PROT_WRITE 2\n'
@@ -409,6 +410,41 @@ def patchUnicornJS():
             '}\n'
             '#else\n'
             '#include <sys/mman.h>\n'
+            '#endif\n\n'
+        )
+    
+    # Fix oslib-posix.c for Emscripten
+    oslib_posix_path = os.path.join(UNICORN_QEMU_DIR, "util/oslib-posix.c")
+    if os.path.exists(oslib_posix_path):
+        prepend(oslib_posix_path,
+            '#ifdef __EMSCRIPTEN__\n'
+            '// Stub mmap functions for Emscripten\n'
+            '#include <stddef.h>\n'
+            '#include <stdlib.h>\n'
+            '#include <sys/types.h>\n'
+            '#define MAP_FAILED ((void *) -1)\n'
+            '#define MAP_PRIVATE 0x02\n'
+            '#define MAP_ANONYMOUS 0x20\n'
+            '#define MAP_ANON MAP_ANONYMOUS\n'
+            '#define MAP_SHARED 0x01\n'
+            '#define MAP_FIXED 0x10\n'
+            '#define PROT_NONE 0\n'
+            '#define PROT_READ 1\n'
+            '#define PROT_WRITE 2\n'
+            '#define PROT_EXEC 4\n'
+            'static inline void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {\n'
+            '    // Emscripten doesn\'t support mmap, use malloc as fallback\n'
+            '    if (addr && (flags & MAP_FIXED)) {\n'
+            '        // If fixed address requested, we can\'t honor it, return failure\n'
+            '        return MAP_FAILED;\n'
+            '    }\n'
+            '    void *ptr = malloc(length);\ n'
+            '    return ptr ? ptr : MAP_FAILED;\n'
+            '}\n'
+            'static inline int munmap(void *addr, size_t length) {\n'
+            '    free(addr);\n'
+            '    return 0;\n'
+            '}\n'
             '#endif\n\n'
         )
     
@@ -540,36 +576,19 @@ def patchUnicornJS():
         """
     })
     # Fix unaligned reads
-    append(os.path.join(UNICORN_QEMU_DIR, "include/qemu-common.h"),
-        PATCH_UNALIGNED_MEMACCESS)
-    replace(os.path.join(UNICORN_QEMU_DIR, "include/exec/exec-all.h"), {
-        "    *(uint32_t *)jmp_addr = addr - (jmp_addr + 4);":
-        "    UNALIGNED_WRITE32_LE(jmp_addr, addr - (jmp_addr + 4));"
-    })
-    replace(os.path.join(UNICORN_QEMU_DIR, "tci.c"), {
-        "*(tcg_target_ulong *)(*tb_ptr)":
-        "UNALIGNED_READ32_LE(*tb_ptr)",
-        "*(uint32_t *)(*tb_ptr)":
-        "UNALIGNED_READ32_LE(*tb_ptr)",
-        "*(int32_t *)(*tb_ptr)":
-        "UNALIGNED_READ32_LE(*tb_ptr)",
-        "*(uint64_t *)tb_ptr":
-        "UNALIGNED_READ64_LE(tb_ptr)",
-        # Stores
-        "*(uint16_t *)(t1 + t2) = t0":
-        "UNALIGNED_WRITE16_LE(t1 + t2, t0)",
-        "*(uint32_t *)(t1 + t2) = t0":
-        "UNALIGNED_WRITE32_LE(t1 + t2, t0)",
-        "*(uint64_t *)(t1 + t2) = t0":
-        "UNALIGNED_WRITE64_LE(t1 + t2, t0)",
-        # Loads
-        "*(uint32_t *)(t1 + t2)":
-        "UNALIGNED_READ32_LE(t1 + t2)",
-        "*(uint64_t *)(t1 + t2)":
-        "UNALIGNED_READ64_LE(t1 + t2)",
-        "*(int32_t *)(t1 + t2)":
-        "(int32_t)UNALIGNED_READ32_LE(t1 + t2)",
-    })
+    qemu_common_h = os.path.join(UNICORN_QEMU_DIR, "include/qemu-common.h")
+    if os.path.exists(qemu_common_h):
+        append(qemu_common_h, PATCH_UNALIGNED_MEMACCESS)
+    
+    exec_all_h = os.path.join(UNICORN_QEMU_DIR, "include/exec/exec-all.h")
+    if os.path.exists(exec_all_h):
+        replace(exec_all_h, {
+            "    *(uint32_t *)jmp_addr = addr - (jmp_addr + 4);":
+            "    UNALIGNED_WRITE32_LE(jmp_addr, addr - (jmp_addr + 4));"
+        })
+    
+    # Note: tci.c doesn't exist in Unicorn 2.x, TCI has been removed or integrated differently
+    # Skip TCI patches for Unicorn 2.x
     # Fix unsupported varargs in uc_hook_add function signature
     replace(os.path.join(UNICORN_DIR, "include/unicorn/unicorn.h"), {
         "        void *user_data, uint64_t begin, uint64_t end, ...);":
