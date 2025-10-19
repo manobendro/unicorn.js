@@ -378,11 +378,6 @@ def patchUnicornJS():
             "(GCompareDataFunc) compare_func) (l1->data, l2->data, user_data)":
                 "(GCompareFunc) compare_func) (l1->data, l2->data)",
         })
-    # Fix Glib function pointer issues
-    replace(os.path.join(UNICORN_QEMU_DIR, "glib_compat.c"), {
-        "(GCompareDataFunc) compare_func) (l1->data, l2->data, user_data)":
-            "(GCompareFunc) compare_func) (l1->data, l2->data)",
-    })
     # Fix QEMU function pointer issues
     replace(os.path.join(UNICORN_QEMU_DIR, "include/exec/helper-proto.h"), {
         # Adapter helpers
@@ -564,17 +559,83 @@ def compileUnicorn(targets):
     patchUnicornTCI()
     patchUnicornJS()
 
-    # Emscripten: Make
+    # For Unicorn 2.x with Emscripten, we need to use a manual build approach
+    # since CMake doesn't support emcc compiler detection
     os.chdir('unicorn')
-    os.system('make clean')
+    
     if os.name == 'posix':
-        cmd = ''
+        # Configure QEMU with Emscripten
+        print("Configuring QEMU with Emscripten...")
+        os.chdir('qemu')
+        
+        # Set up target list
         if targets:
-            cmd += 'UNICORN_ARCHS="%s" ' % (' '.join(targets))
-        cmd += 'emmake make unicorn'
-        os.system(cmd)
+            target_list = ','.join([t + '-softmmu' for t in targets])
+        else:
+            # Default to all supported architectures
+            target_list = 'aarch64-softmmu,arm-softmmu,m68k-softmmu,mips-softmmu,mipsel-softmmu,mips64-softmmu,mips64el-softmmu,ppc-softmmu,ppc64-softmmu,riscv32-softmmu,riscv64-softmmu,s390x-softmmu,sparc-softmmu,sparc64-softmmu,tricore-softmmu,i386-softmmu,x86_64-softmmu'
+        
+        configure_cmd = 'emconfigure ./configure'
+        configure_cmd += ' --target-list=' + target_list
+        configure_cmd += ' --disable-stack-protector'
+        configure_cmd += ' --extra-cflags="-DUNICORN_HAS_X86 -DUNICORN_HAS_ARM -DUNICORN_HAS_M68K -DUNICORN_HAS_MIPS -DUNICORN_HAS_PPC -DUNICORN_HAS_RISCV -DUNICORN_HAS_S390X -DUNICORN_HAS_SPARC -DUNICORN_HAS_TRICORE"'
+        
+        ret = os.system(configure_cmd)
+        if ret != 0:
+            print("QEMU configuration failed!")
+            os.chdir('../..')
+            return
+        
+        # Build QEMU
+        print("Building QEMU...")
+        ret = os.system('emmake make -j$(nproc)')
+        if ret != 0:
+            print("QEMU build failed!")
+            os.chdir('../..')
+            return
+        
+        os.chdir('..')
+        
+        # Now build Unicorn itself
+        print("Building Unicorn library...")
+        
+        # Collect all object files
+        import glob
+        obj_files = []
+        for root, dirs, files in os.walk('qemu'):
+            for f in files:
+                if f.endswith('.o'):
+                    obj_files.append(os.path.join(root, f))
+        
+        # Add unicorn core files
+        unicorn_sources = ['uc.c', 'list.c']
+        for src in glob.glob('glib_compat/*.c'):
+            unicorn_sources.append(src)
+        
+        # Compile unicorn sources
+        for src in unicorn_sources:
+            obj = src.replace('.c', '.o')
+            compile_cmd = 'emcc -c -Os '
+            compile_cmd += '-DUNICORN_HAS_X86 -DUNICORN_HAS_ARM -DUNICORN_HAS_M68K -DUNICORN_HAS_MIPS '
+            compile_cmd += '-DUNICORN_HAS_PPC -DUNICORN_HAS_RISCV -DUNICORN_HAS_S390X -DUNICORN_HAS_SPARC -DUNICORN_HAS_TRICORE '
+            compile_cmd += '-Iinclude -Iqemu/include -Iqemu -Iglib_compat '
+            compile_cmd += src + ' -o ' + obj
+            os.system(compile_cmd)
+            obj_files.append(obj)
+        
+        # Create static library
+        print("Creating static library...")
+        ar_cmd = 'emar rcs libunicorn.a ' + ' '.join(obj_files)
+        os.system(ar_cmd)
+    
     os.chdir('..')
 
+    # Check if library was built successfully
+    if not os.path.exists('unicorn/libunicorn.a'):
+        print("Error: libunicorn.a was not built successfully")
+        return
+
+    print("Compiling to JavaScript...")
     # Compile static library to JavaScript
     methods = ['ccall', 'getValue', 'setValue', 'addFunction', 'removeFunction', 'writeArrayToMemory']
     cmd = 'emcc'
@@ -594,7 +655,11 @@ def compileUnicorn(targets):
         cmd += ' -o src/libunicorn-%s.out.js' % ('-'.join(targets))
     else:
         cmd += ' -o src/libunicorn.out.js'
-    os.system(cmd)
+    ret = os.system(cmd)
+    if ret == 0:
+        print("Build completed successfully!")
+    else:
+        print("JavaScript compilation failed!")
 
 
 def exit_usage():
